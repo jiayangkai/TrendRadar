@@ -1,0 +1,37 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python cache & artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+pip-wheel-metadata/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+env/
+
+# Logs
+logs/
+*.log
+
+# IDE & editor
+.vscode/
+.idea/
+*.code-workspace
+
+# Build & dist
+build/
+dist/
+.cache/
+
+# Project generated outputs
+output/
+
+# Keep configuration files tracked
+# (do NOT ignore config/config.yaml or config/frequency_words.txt)
