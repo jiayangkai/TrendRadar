@@ -142,6 +142,28 @@ def load_config():
             "HOTNESS_WEIGHT": config_data["weight"]["hotness_weight"],
         },
         "PLATFORMS": config_data["platforms"],
+        "AUTO_HOTWORDS": {
+            "ENABLED": (
+                os.environ.get("AUTO_HOTWORDS_ENABLED", "").strip().lower() in ("true", "1")
+                if os.environ.get("AUTO_HOTWORDS_ENABLED", "").strip()
+                else config_data.get("report", {}).get("auto_hotwords", {}).get("enabled", True)
+            ),
+            "TOP_N": int(
+                os.environ.get("AUTO_HOTWORDS_TOP_N", "").strip() or "10"
+            )
+            if os.environ.get("AUTO_HOTWORDS_TOP_N", "").strip()
+            else config_data.get("report", {}).get("auto_hotwords", {}).get("top_n", 10),
+            "MIN_FREQ": int(
+                os.environ.get("AUTO_HOTWORDS_MIN_FREQ", "").strip() or "2"
+            )
+            if os.environ.get("AUTO_HOTWORDS_MIN_FREQ", "").strip()
+            else config_data.get("report", {}).get("auto_hotwords", {}).get("min_freq", 2),
+            "USE_TFIDF": (
+                os.environ.get("AUTO_HOTWORDS_USE_TFIDF", "").strip().lower() in ("true", "1")
+                if os.environ.get("AUTO_HOTWORDS_USE_TFIDF", "").strip()
+                else config_data.get("report", {}).get("auto_hotwords", {}).get("use_tfidf", False)
+            ),
+        },
     }
 
     # 通知渠道配置（环境变量优先）
@@ -151,6 +173,9 @@ def load_config():
     config["FEISHU_WEBHOOK_URL"] = os.environ.get(
         "FEISHU_WEBHOOK_URL", ""
     ).strip() or webhooks.get("feishu_url", "")
+    config["FEISHU_MSG_TYPE"] = (
+        os.environ.get("FEISHU_MSG_TYPE", "").strip() or webhooks.get("feishu_msg_type", "text")
+    )
     config["DINGTALK_WEBHOOK_URL"] = os.environ.get(
         "DINGTALK_WEBHOOK_URL", ""
     ).strip() or webhooks.get("dingtalk_url", "")
@@ -1507,7 +1532,72 @@ def prepare_report_data(
         "total_new_count": sum(
             len(source["titles"]) for source in processed_new_titles
         ),
+        "auto_hotwords": _generate_auto_hotwords_section() if CONFIG["AUTO_HOTWORDS"]["ENABLED"] else None,
     }
+
+
+def _simple_extract_keywords(title: str, min_length: int = 2) -> List[str]:
+    """从标题中进行简易关键词提取，适用于中文标题的词云基础统计"""
+    # 移除URL
+    title = re.sub(r"http[s]?://\S+", "", title)
+    # 非字母数字与空白替换为空格
+    title = re.sub(r"[^\w\s]", " ", title)
+    # 以空白与常见中文标点分割
+    words = re.split(r"[\s，。！？、;；：]+", title)
+
+    stopwords = {
+        "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个", "上",
+        "也", "很", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好", "自己", "这",
+        "发布", "消息", "报道", "最新", "官宣", "网友", "媒体", "视频", "直播", "图文", "评论", "热搜",
+    }
+
+    result = []
+    for w in words:
+        w = w.strip()
+        if not w:
+            continue
+        if len(w) < min_length:
+            continue
+        if w in stopwords:
+            continue
+        result.append(w)
+    return result
+
+
+def _generate_auto_hotwords_section() -> Optional[Dict]:
+    """生成自动热词提取结果（词云/TopN），并返回用于推送展示的结构"""
+    try:
+        current_platform_ids = [p["id"] for p in CONFIG["PLATFORMS"]]
+        all_results, _, _ = read_all_today_titles(current_platform_ids)
+        if not all_results:
+            return None
+
+        top_n = CONFIG["AUTO_HOTWORDS"]["TOP_N"]
+        min_freq = CONFIG["AUTO_HOTWORDS"]["MIN_FREQ"]
+
+        counter: Dict[str, int] = {}
+        for _, titles in all_results.items():
+            for title in titles.keys():
+                for kw in _simple_extract_keywords(title):
+                    counter[kw] = counter.get(kw, 0) + 1
+
+        # 过滤最小频次
+        items = [(k, v) for k, v in counter.items() if v >= min_freq]
+        # 排序（可扩展为TF-IDF，此处先使用频次）
+        items.sort(key=lambda x: x[1], reverse=True)
+        top_items = items[:top_n]
+
+        keywords = [{"keyword": k, "frequency": v} for k, v in top_items]
+        word_cloud = [{"text": k, "value": v} for k, v in top_items]
+
+        return {
+            "keywords": keywords,
+            "word_cloud": word_cloud,
+            "generated_at": get_beijing_time().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    except Exception as e:
+        print(f"自动热词提取失败：{e}")
+        return None
 
 
 def format_title_for_platform(
@@ -1524,23 +1614,23 @@ def format_title_for_platform(
 
     if platform == "feishu":
         if link_url:
-            formatted_title = f"[{cleaned_title}]({link_url})"
+            formatted_title = f"{cleaned_title} {link_url}"
         else:
             formatted_title = cleaned_title
 
         title_prefix = "🆕 " if title_data.get("is_new") else ""
 
         if show_source:
-            result = f"<font color='grey'>[{title_data['source_name']}]</font> {title_prefix}{formatted_title}"
+            result = f"[{title_data['source_name']}] {title_prefix}{formatted_title}"
         else:
             result = f"{title_prefix}{formatted_title}"
 
         if rank_display:
             result += f" {rank_display}"
         if title_data["time_display"]:
-            result += f" <font color='grey'>- {title_data['time_display']}</font>"
+            result += f" - {title_data['time_display']}"
         if title_data["count"] > 1:
-            result += f" <font color='green'>({title_data['count']}次)</font>"
+            result += f" ({title_data['count']}次)"
 
         return result
 
@@ -1703,6 +1793,86 @@ def generate_html_report(
         root_file_path = Path("index.html")
         with open(root_file_path, "w", encoding="utf-8") as f:
             f.write(html_content)
+
+    return file_path
+
+
+def generate_auto_hotwords_html(mode: str = "daily") -> Optional[str]:
+    """生成自动热词独立HTML报告，用于词云展示与后续趋势分析持久化"""
+    if not CONFIG.get("AUTO_HOTWORDS", {}).get("ENABLED", False):
+        return None
+
+    data = _generate_auto_hotwords_section()
+    if not data or not data.get("keywords"):
+        return None
+
+    filename = "自动提取热词.html" if mode == "daily" else ("自动提取热词-当前.html" if mode == "current" else f"自动提取热词-{mode}.html")
+    file_path = get_output_path("html", filename)
+
+    now = get_beijing_time()
+    keywords = data.get("keywords", [])
+    max_freq = max([item.get("frequency", 0) for item in keywords]) if keywords else 0
+    min_font = 12
+    max_font = 36
+
+    def font_size(freq: int) -> int:
+        if max_freq <= 0:
+            return min_font
+        scale = (freq / max_freq)
+        return int(min_font + (max_font - min_font) * scale)
+
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset=\"UTF-8\">
+        <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">
+        <title>自动提取热词</title>
+        <style>
+            * {{ box-sizing: border-box; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; margin: 0; padding: 16px; background: #fafafa; color: #333; }}
+            .container {{ max-width: 680px; margin: 0 auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 16px rgba(0,0,0,0.06); }}
+            .header {{ background: linear-gradient(135deg, #0ea5e9 0%, #22d3ee 100%); color: white; padding: 28px 24px; text-align: center; }}
+            .header-title {{ font-size: 22px; font-weight: 700; margin: 0 0 10px 0; }}
+            .header-info {{ font-size: 13px; opacity: 0.9; }}
+            .content {{ padding: 24px; }}
+            .section-title {{ font-size: 16px; font-weight: 600; margin: 0 0 12px 0; }}
+            .cloud {{ display: flex; flex-wrap: wrap; gap: 10px 12px; border: 1px dashed #eaeaea; border-radius: 8px; padding: 16px; background: #fcfcff; }}
+            .cloud .item {{ display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: 6px; background: #f4f7ff; color: #1e3a8a; }}
+            .list {{ margin-top: 16px; }}
+            .list-item {{ display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid #f5f5f5; }}
+            .list-item:last-child {{ border-bottom: none; }}
+            .kw {{ font-weight: 600; color: #111827; }}
+            .freq {{ font-size: 12px; color: #6b7280; }}
+            .footer {{ padding: 16px 24px 24px; color: #6b7280; font-size: 12px; }}
+            .badge {{ display: inline-block; background: #eef2ff; color: #3730a3; border: 1px solid #c7d2fe; padding: 2px 8px; border-radius: 999px; font-size: 12px; margin-left: 6px; }}
+        </style>
+    </head>
+    <body>
+        <div class=\"container\">
+            <div class=\"header\">
+                <div class=\"header-title\">自动提取热词（词云）</div>
+                <div class=\"header-info\">Top {CONFIG['AUTO_HOTWORDS']['TOP_N']} · 最小频次 {CONFIG['AUTO_HOTWORDS']['MIN_FREQ']} · 更新时间 {now.strftime('%Y-%m-%d %H:%M:%S')}</div>
+            </div>
+            <div class=\"content\">
+                <div class=\"section-title\">词云</div>
+                <div class=\"cloud\">
+                    {''.join([f"<span class='item' style='font-size:{font_size(item.get('frequency',0))}px'>{item.get('keyword','')}<span class='badge'>{item.get('frequency',0)}</span></span>" for item in keywords])}
+                </div>
+                <div class=\"section-title\" style=\"margin-top:18px\">Top 列表</div>
+                <div class=\"list\">
+                    {''.join([f"<div class='list-item'><span class='kw'>{item.get('keyword','')}</span><span class='freq'>{item.get('frequency',0)}</span></div>" for item in keywords])}
+                </div>
+            </div>
+            <div class=\"footer\">数据用于后续热点趋势分析持久化</div>
+        </div>
+        <script id=\"auto-hotwords-data\" type=\"application/json\">{json.dumps(data, ensure_ascii=False)}</script>
+    </body>
+    </html>
+    """
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(html)
 
     return file_path
 
@@ -2950,9 +3120,9 @@ def split_content_into_batches(
         if update_info:
             base_footer += f"\n> TrendRadar 发现新版本 **{update_info['remote_version']}**，当前 **{update_info['current_version']}**"
     elif format_type == "feishu":
-        base_footer = f"\n\n<font color='grey'>更新时间：{now.strftime('%Y-%m-%d %H:%M:%S')}</font>"
+        base_footer = f"\n\n更新时间：{now.strftime('%Y-%m-%d %H:%M:%S')}"
         if update_info:
-            base_footer += f"\n<font color='grey'>TrendRadar 发现新版本 {update_info['remote_version']}，当前 {update_info['current_version']}</font>"
+            base_footer += f"\nTrendRadar 发现新版本 {update_info['remote_version']}，当前 {update_info['current_version']}"
     elif format_type == "dingtalk":
         base_footer = f"\n\n> 更新时间：{now.strftime('%Y-%m-%d %H:%M:%S')}"
         if update_info:
@@ -3047,11 +3217,11 @@ def split_content_into_batches(
                     word_header = f"📌 {sequence_display} **{word}** : {count} 条\n\n"
             elif format_type == "feishu":
                 if count >= 10:
-                    word_header = f"🔥 <font color='grey'>{sequence_display}</font> **{word}** : <font color='red'>{count}</font> 条\n\n"
+                    word_header = f"🔥 {sequence_display} {word} : {count} 条\n\n"
                 elif count >= 5:
-                    word_header = f"📈 <font color='grey'>{sequence_display}</font> **{word}** : <font color='orange'>{count}</font> 条\n\n"
+                    word_header = f"📈 {sequence_display} {word} : {count} 条\n\n"
                 else:
-                    word_header = f"📌 <font color='grey'>{sequence_display}</font> **{word}** : {count} 条\n\n"
+                    word_header = f"📌 {sequence_display} {word} : {count} 条\n\n"
             elif format_type == "dingtalk":
                 if count >= 10:
                     word_header = (
@@ -3167,7 +3337,7 @@ def split_content_into_batches(
                 elif format_type == "ntfy":
                     separator = f"\n\n"
                 elif format_type == "feishu":
-                    separator = f"\n{CONFIG['FEISHU_MESSAGE_SEPARATOR']}\n\n"
+                    separator = f"\n---\n\n"
                 elif format_type == "dingtalk":
                     separator = f"\n---\n\n"
 
@@ -3190,7 +3360,7 @@ def split_content_into_batches(
         elif format_type == "ntfy":
             new_header = f"\n\n🆕 **本次新增热点新闻** (共 {report_data['total_new_count']} 条)\n\n"
         elif format_type == "feishu":
-            new_header = f"\n{CONFIG['FEISHU_MESSAGE_SEPARATOR']}\n\n🆕 **本次新增热点新闻** (共 {report_data['total_new_count']} 条)\n\n"
+            new_header = f"\n---\n\n🆕 本次新增热点新闻 (共 {report_data['total_new_count']} 条)\n\n"
         elif format_type == "dingtalk":
             new_header = f"\n---\n\n🆕 **本次新增热点新闻** (共 {report_data['total_new_count']} 条)\n\n"
 
@@ -3217,7 +3387,7 @@ def split_content_into_batches(
             elif format_type == "ntfy":
                 source_header = f"**{source_data['source_name']}** ({len(source_data['titles'])} 条):\n\n"
             elif format_type == "feishu":
-                source_header = f"**{source_data['source_name']}** ({len(source_data['titles'])} 条):\n\n"
+                source_header = f"{source_data['source_name']} ({len(source_data['titles'])} 条):\n\n"
             elif format_type == "dingtalk":
                 source_header = f"**{source_data['source_name']}** ({len(source_data['titles'])} 条):\n\n"
 
@@ -3318,7 +3488,7 @@ def split_content_into_batches(
         elif format_type == "ntfy":
             failed_header = f"\n\n⚠️ **数据获取失败的平台：**\n\n"
         elif format_type == "feishu":
-            failed_header = f"\n{CONFIG['FEISHU_MESSAGE_SEPARATOR']}\n\n⚠️ **数据获取失败的平台：**\n\n"
+            failed_header = f"\n---\n\n⚠️ 数据获取失败的平台：\n\n"
         elif format_type == "dingtalk":
             failed_header = f"\n---\n\n⚠️ **数据获取失败的平台：**\n\n"
 
@@ -3337,7 +3507,7 @@ def split_content_into_batches(
 
         for i, id_value in enumerate(report_data["failed_ids"], 1):
             if format_type == "feishu":
-                failed_line = f"  • <font color='red'>{id_value}</font>\n"
+                failed_line = f"  • {id_value}\n"
             elif format_type == "dingtalk":
                 failed_line = f"  • **{id_value}**\n"
             else:
@@ -3360,6 +3530,118 @@ def split_content_into_batches(
     if current_batch_has_content:
         batches.append(current_batch + base_footer)
 
+    return batches
+
+
+def build_feishu_post_batches(
+    report_data: Dict,
+    update_info: Optional[Dict] = None,
+    mode: str = "daily",
+    max_bytes: int = 29000,
+) -> List[Dict]:
+    """构造飞书post富文本的分批内容"""
+    batches: List[Dict] = []
+    now = get_beijing_time()
+
+    current: Dict = {
+        "title": f"TrendRadar 热点分析报告 - {mode}",
+        "content": [],
+    }
+
+    def paragraph(elements: List[Dict]) -> None:
+        nonlocal current, batches
+        test = dict(current)
+        test["content"] = current["content"] + [elements]
+        size = len(json.dumps(test, ensure_ascii=False).encode("utf-8"))
+        if size >= max_bytes:
+            batches.append(current)
+            current = {"title": f"TrendRadar 热点分析报告 - {mode}", "content": [elements]}
+        else:
+            current["content"].append(elements)
+
+    total_titles = sum(len(stat["titles"]) for stat in report_data["stats"] if stat["count"] > 0)
+    paragraph([{"tag": "text", "text": f"总新闻数：{total_titles}"}])
+
+    # 自动提取热词（词云）
+    auto_section = report_data.get("auto_hotwords")
+    if auto_section and auto_section.get("keywords"):
+        paragraph([{"tag": "text", "text": "☁️ 自动提取热词（词云）"}])
+        for item in auto_section["keywords"]:
+            word = item.get("keyword", "")
+            freq = item.get("frequency", 0)
+            paragraph([{ "tag": "text", "text": f"• {word} : {freq}" }])
+        paragraph([{ "tag": "text", "text": "---" }])
+
+    if report_data["stats"]:
+        paragraph([{"tag": "text", "text": "📊 热点词汇统计"}])
+        total_count = len(report_data["stats"])
+        for i, stat in enumerate(report_data["stats"]):
+            seq = f"[{i+1}/{total_count}]"
+            header_text = "📌"
+            if stat["count"] >= 10:
+                header_text = "🔥"
+            elif stat["count"] >= 5:
+                header_text = "📈"
+            paragraph([
+                {"tag": "text", "text": f"{header_text} {seq} {stat['word']} : {stat['count']} 条"}
+            ])
+
+            for idx, title in enumerate(stat["titles"], 1):
+                link = title.get("mobile_url") or title.get("url") or ""
+                pieces: List[Dict] = []
+                src = title.get("source_name", "")
+                prefix = f"{idx}. [{src}] " if src else f"{idx}. "
+                pieces.append({"tag": "text", "text": prefix})
+                if link:
+                    pieces.append({"tag": "a", "text": clean_title(title.get("title", "")), "href": link})
+                else:
+                    pieces.append({"tag": "text", "text": clean_title(title.get("title", ""))})
+                addon = []
+                rank_disp = format_rank_display(title.get("ranks", []), title.get("rank_threshold"), "feishu")
+                if rank_disp:
+                    addon.append(rank_disp)
+                if title.get("time_display"):
+                    addon.append(f"- {title['time_display']}")
+                if title.get("count", 0) > 1:
+                    addon.append(f"({title['count']}次)")
+                if addon:
+                    pieces.append({"tag": "text", "text": " " + " ".join(addon)})
+                paragraph(pieces)
+
+            if i < len(report_data["stats"]) - 1:
+                paragraph([{"tag": "text", "text": "---"}])
+
+    if report_data["new_titles"]:
+        paragraph([{"tag": "text", "text": f"---"}])
+        paragraph([{"tag": "text", "text": f"🆕 本次新增热点新闻 (共 {report_data['total_new_count']} 条)"}])
+        for source in report_data["new_titles"]:
+            paragraph([{"tag": "text", "text": f"{source['source_name']} ({len(source['titles'])} 条):"}])
+            for idx, title in enumerate(source["titles"], 1):
+                link = title.get("mobile_url") or title.get("url") or ""
+                pieces: List[Dict] = []
+                prefix = f"{idx}. "
+                pieces.append({"tag": "text", "text": prefix})
+                if link:
+                    pieces.append({"tag": "a", "text": clean_title(title.get("title", "")), "href": link})
+                else:
+                    pieces.append({"tag": "text", "text": clean_title(title.get("title", ""))})
+                paragraph(pieces)
+
+    if report_data["failed_ids"]:
+        paragraph([{"tag": "text", "text": "---"}])
+        paragraph([{"tag": "text", "text": "⚠️ 数据获取失败的平台："}])
+        for idv in report_data["failed_ids"]:
+            paragraph([{"tag": "text", "text": f"• {idv}"}])
+
+    footer_lines = [f"更新时间：{now.strftime('%Y-%m-%d %H:%M:%S')}"]
+    if update_info:
+        footer_lines.append(
+            f"TrendRadar 发现新版本 {update_info['remote_version']}，当前 {update_info['current_version']}"
+        )
+    paragraph([{"tag": "text", "text": "\n".join(footer_lines)}])
+
+    if current["content"]:
+        batches.append(current)
     return batches
 
 
@@ -3504,40 +3786,85 @@ def send_to_feishu(
     proxy_url: Optional[str] = None,
     mode: str = "daily",
 ) -> bool:
-    """发送到飞书（支持分批发送）"""
+    """发送到飞书（支持 text 和 post 两种格式，均支持分批）"""
     headers = {"Content-Type": "application/json"}
     proxies = None
     if proxy_url:
         proxies = {"http": proxy_url, "https": proxy_url}
 
-    # 获取分批内容，使用飞书专用的批次大小
+    msg_type = str(CONFIG.get("FEISHU_MSG_TYPE", "text")).lower()
+    max_bytes = CONFIG.get("FEISHU_BATCH_SIZE", 29000)
+
+    if msg_type == "post":
+        post_batches = build_feishu_post_batches(
+            report_data, update_info, mode, max_bytes
+        )
+        print(f"飞书(post)消息分为 {len(post_batches)} 批次发送 [{report_type}]")
+
+        for i, post_content in enumerate(post_batches, 1):
+            # 估算大小
+            try:
+                batch_size = len(json.dumps(post_content, ensure_ascii=False).encode("utf-8"))
+            except Exception:
+                batch_size = 0
+            print(
+                f"发送飞书(post)第 {i}/{len(post_batches)} 批次，大小：{batch_size} 字节 [{report_type}]"
+            )
+
+            payload = {
+                "msg_type": "post",
+                "content": {
+                    "post": {"zh_cn": post_content}
+                },
+            }
+
+            try:
+                response = requests.post(
+                    webhook_url, headers=headers, json=payload, proxies=proxies, timeout=30
+                )
+                if response.status_code == 200:
+                    result = response.json()
+                    if result.get("StatusCode") == 0 or result.get("code") == 0:
+                        print(f"飞书(post)第 {i}/{len(post_batches)} 批次发送成功 [{report_type}]")
+                        if i < len(post_batches):
+                            time.sleep(CONFIG["BATCH_SEND_INTERVAL"])
+                    else:
+                        error_msg = result.get("msg") or result.get("StatusMessage", "未知错误")
+                        print(
+                            f"飞书(post)第 {i}/{len(post_batches)} 批次发送失败 [{report_type}]，错误：{error_msg}"
+                        )
+                        return False
+                else:
+                    print(
+                        f"飞书(post)第 {i}/{len(post_batches)} 批次发送失败 [{report_type}]，状态码：{response.status_code}"
+                    )
+                    return False
+            except Exception as e:
+                print(f"飞书(post)第 {i}/{len(post_batches)} 批次发送出错 [{report_type}]：{e}")
+                return False
+
+        print(f"飞书(post)所有 {len(post_batches)} 批次发送完成 [{report_type}]")
+        return True
+
+    # 默认 text
     batches = split_content_into_batches(
-        report_data,
-        "feishu",
-        update_info,
-        max_bytes=CONFIG.get("FEISHU_BATCH_SIZE", 29000),
-        mode=mode,
+        report_data, "feishu", update_info, max_bytes=max_bytes, mode=mode
     )
+    print(f"飞书(text)消息分为 {len(batches)} 批次发送 [{report_type}]")
 
-    print(f"飞书消息分为 {len(batches)} 批次发送 [{report_type}]")
-
-    # 逐批发送
     for i, batch_content in enumerate(batches, 1):
         batch_size = len(batch_content.encode("utf-8"))
         print(
-            f"发送飞书第 {i}/{len(batches)} 批次，大小：{batch_size} 字节 [{report_type}]"
+            f"发送飞书(text)第 {i}/{len(batches)} 批次，大小：{batch_size} 字节 [{report_type}]"
         )
 
-        # 添加批次标识
         if len(batches) > 1:
             batch_header = f"**[第 {i}/{len(batches)} 批次]**\n\n"
-            # 将批次标识插入到适当位置（在统计标题之后）
             if "📊 **热点词汇统计**" in batch_content:
                 batch_content = batch_content.replace(
                     "📊 **热点词汇统计**\n\n", f"📊 **热点词汇统计** {batch_header}"
                 )
             else:
-                # 如果没有统计标题，直接在开头添加
                 batch_content = batch_header + batch_content
 
         total_titles = sum(
@@ -3561,28 +3888,26 @@ def send_to_feishu(
             )
             if response.status_code == 200:
                 result = response.json()
-                # 检查飞书的响应状态
                 if result.get("StatusCode") == 0 or result.get("code") == 0:
-                    print(f"飞书第 {i}/{len(batches)} 批次发送成功 [{report_type}]")
-                    # 批次间间隔
+                    print(f"飞书(text)第 {i}/{len(batches)} 批次发送成功 [{report_type}]")
                     if i < len(batches):
                         time.sleep(CONFIG["BATCH_SEND_INTERVAL"])
                 else:
                     error_msg = result.get("msg") or result.get("StatusMessage", "未知错误")
                     print(
-                        f"飞书第 {i}/{len(batches)} 批次发送失败 [{report_type}]，错误：{error_msg}"
+                        f"飞书(text)第 {i}/{len(batches)} 批次发送失败 [{report_type}]，错误：{error_msg}"
                     )
                     return False
             else:
                 print(
-                    f"飞书第 {i}/{len(batches)} 批次发送失败 [{report_type}]，状态码：{response.status_code}"
+                    f"飞书(text)第 {i}/{len(batches)} 批次发送失败 [{report_type}]，状态码：{response.status_code}"
                 )
                 return False
         except Exception as e:
-            print(f"飞书第 {i}/{len(batches)} 批次发送出错 [{report_type}]：{e}")
+            print(f"飞书(text)第 {i}/{len(batches)} 批次发送出错 [{report_type}]：{e}")
             return False
 
-    print(f"飞书所有 {len(batches)} 批次发送完成 [{report_type}]")
+    print(f"飞书(text)所有 {len(batches)} 批次发送完成 [{report_type}]")
     return True
 
 
@@ -4575,6 +4900,13 @@ class NewsAnalyzer:
 
         print(f"{summary_type}报告已生成: {html_file}")
 
+        try:
+            auto_html = generate_auto_hotwords_html(mode_strategy["summary_mode"])
+            if auto_html:
+                print(f"自动热词词云报告已生成: {auto_html}")
+        except Exception as e:
+            print(f"自动热词词云报告生成失败：{e}")
+
         # 发送通知
         self._send_notification_if_needed(
             stats,
@@ -4615,6 +4947,13 @@ class NewsAnalyzer:
         )
 
         print(f"{summary_type}HTML已生成: {html_file}")
+
+        try:
+            auto_html = generate_auto_hotwords_html(mode)
+            if auto_html:
+                print(f"自动热词词云报告已生成: {auto_html}")
+        except Exception as e:
+            print(f"自动热词词云报告生成失败：{e}")
         return html_file
 
     def _initialize_and_check_config(self) -> None:
